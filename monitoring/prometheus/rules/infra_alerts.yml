@@ -1,0 +1,67 @@
+# =============================================================================
+# monitoring/prometheus/rules/infra_alerts.yml
+# Infrastructure alert rules (container resources)
+# =============================================================================
+
+groups:
+
+  - name: container_resources
+    rules:
+
+      - alert: ContainerHighMemoryUsage
+        expr: |
+          (
+            container_memory_usage_bytes{name=~"api|mlflow|airflow.*"}
+            /
+            container_spec_memory_limit_bytes{name=~"api|mlflow|airflow.*"}
+          ) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Container {{ $labels.name }} memory > 85% of limit"
+          description: "Memory usage = {{ $value | humanizePercentage }} of limit."
+
+      - alert: ContainerHighCPU
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{name=~"api|mlflow"}[5m])) by (name)
+          * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Container {{ $labels.name }} CPU > 80%"
+          description: "CPU = {{ $value | humanize }}%. Check for model inference bottleneck."
+
+      - alert: ContainerRestartLoop
+        expr: |
+          increase(container_restart_count{name=~"api|mlflow"}[30m]) > 3
+        labels:
+          severity: critical
+        annotations:
+          summary:     "Container {{ $labels.name }} restarting frequently"
+          description: "{{ $value }} restarts in 30 minutes. Check logs."
+
+  - name: disk_space
+    rules:
+
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+          < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Disk space below 15% on root filesystem"
+          description: "Available: {{ $value | humanizePercentage }}. Clean old data or expand disk."
+
+      - alert: PrometheusStorageFull
+        expr: |
+          prometheus_tsdb_storage_blocks_bytes / (8 * 1024 * 1024 * 1024) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Prometheus storage > 85% of 8GB limit"
+          description: "Consider increasing retention or storage size."
