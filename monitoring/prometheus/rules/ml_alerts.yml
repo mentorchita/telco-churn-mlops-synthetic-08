@@ -1,0 +1,228 @@
+# =============================================================================
+# monitoring/prometheus/rules/ml_alerts.yml
+# ML Model health alert rules for telco-churn-mlops
+#
+# Validate:
+#   promtool check rules monitoring/prometheus/rules/ml_alerts.yml
+#
+# Test fire manually (Demo 6):
+#   curl -X POST http://localhost:9093/api/v2/alerts \
+#     -H 'Content-Type: application/json' \
+#     -d '[{"labels":{"alertname":"TestAlert","severity":"warning","job":"churn-api"}}]'
+# =============================================================================
+
+groups:
+
+  # ════════════════════════════════════════════════════════
+  # GROUP 1: Prediction Latency
+  # ════════════════════════════════════════════════════════
+  - name: prediction_latency
+    rules:
+
+      # Warning: p99 > 500ms for 2 minutes
+      - alert: PredictionLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(prediction_latency_seconds_bucket[5m])) by (le, model_version)
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          team:     ml-platform
+        annotations:
+          summary:     "p99 prediction latency > 500ms"
+          description: |
+            Model {{ $labels.model_version }} p99 latency = {{ $value | humanizeDuration }}.
+            SLO threshold: 500ms.
+          runbook_url: "https://wiki.company.com/mlops/runbooks/latency"
+
+      # Critical: p99 > 2s for 1 minute (SLA breach)
+      - alert: PredictionLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(prediction_latency_seconds_bucket[5m])) by (le, model_version)
+          ) > 2.0
+        for: 1m
+        labels:
+          severity: critical
+          team:     ml-platform
+        annotations:
+          summary:     "p99 prediction latency > 2s — SLA BREACH"
+          description: |
+            Model {{ $labels.model_version }} p99 = {{ $value | humanizeDuration }}.
+            Immediate investigation required.
+
+  # ════════════════════════════════════════════════════════
+  # GROUP 2: Prediction Error Rate
+  # ════════════════════════════════════════════════════════
+  - name: prediction_errors
+    rules:
+
+      # Warning: error rate > 5%
+      - alert: HighPredictionErrorRate
+        expr: |
+          sum(rate(predictions_total{outcome="error"}[5m]))
+          /
+          sum(rate(predictions_total[5m]))
+          > 0.05
+        for: 1m
+        labels:
+          severity: warning
+          team:     ml-platform
+        annotations:
+          summary:     "Prediction error rate > 5%"
+          description: |
+            Current error rate: {{ $value | humanizePercentage }}.
+            Check /predict endpoint and input validation.
+
+      # Critical: error rate > 20%
+      - alert: CriticalPredictionErrorRate
+        expr: |
+          sum(rate(predictions_total{outcome="error"}[5m]))
+          /
+          sum(rate(predictions_total[5m]))
+          > 0.20
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary:     "Prediction error rate > 20% — service degraded"
+          description: "Error rate = {{ $value | humanizePercentage }}. Possible model or data pipeline failure."
+
+  # ════════════════════════════════════════════════════════
+  # GROUP 3: Model Quality
+  # ════════════════════════════════════════════════════════
+  - name: model_quality
+    rules:
+
+      # Warning: accuracy drops below 0.82
+      - alert: ModelAccuracyLow
+        expr: model_accuracy < 0.82
+        for: 5m
+        labels:
+          severity: warning
+          team:     ml-platform
+        annotations:
+          summary:     "Model accuracy below 0.82 threshold"
+          description: |
+            Model {{ $labels.model_version }} accuracy = {{ $value | humanize }}.
+            SLO: >= 0.82. Consider retraining.
+
+      # Critical: accuracy drops below 0.75
+      - alert: ModelAccuracyCritical
+        expr: model_accuracy < 0.75
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary:     "Model accuracy critical — below 0.75"
+          description: |
+            Accuracy = {{ $value | humanize }}.
+            Immediate model rollback or retrain required.
+
+      # Zero predictions — model may be broken
+      - alert: NoPredictionsMade
+        expr: |
+          sum(rate(predictions_total[5m])) == 0
+          and
+          up{job="churn-api"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "No predictions made in 5 minutes despite API being up"
+          description: "Check if clients are sending requests and model is loaded correctly."
+
+  # ════════════════════════════════════════════════════════
+  # GROUP 4: Data Drift
+  # ════════════════════════════════════════════════════════
+  - name: data_drift
+    rules:
+
+      # Warning: any feature KS score > 0.3
+      - alert: FeatureDriftDetected
+        expr: |
+          max by (feature_name, model_version) (feature_drift_score) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team:     ml-platform
+        annotations:
+          summary:     "Feature drift detected: {{ $labels.feature_name }}"
+          description: |
+            Feature: {{ $labels.feature_name }}
+            KS score: {{ $value | humanize }} (threshold: 0.3)
+            Model: {{ $labels.model_version }}
+            Investigate training data distribution shift.
+
+      # Critical: severe drift requires retraining
+      - alert: SevereDriftRetrainRequired
+        expr: |
+          max by (feature_name, model_version) (feature_drift_score) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary:     "Severe drift on {{ $labels.feature_name }} — retrain required"
+          description: |
+            KS score = {{ $value | humanize }}.
+            Trigger retraining pipeline immediately.
+
+      # PSI drift on categorical features
+      - alert: CategoricalFeatureDrift
+        expr: |
+          max by (feature_name, model_version) (feature_psi_score) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "PSI drift on categorical feature {{ $labels.feature_name }}"
+          description: "PSI = {{ $value | humanize }} (threshold: 0.25 = significant)"
+
+      # Data quality: null values appearing
+      - alert: HighNullFeatureRate
+        expr: |
+          sum(rate(null_features_total[5m])) by (feature_name)
+          /
+          sum(rate(predictions_total[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "High null rate for feature {{ $labels.feature_name }}"
+          description: "{{ $value | humanizePercentage }} of requests have null {{ $labels.feature_name }}"
+
+  # ════════════════════════════════════════════════════════
+  # GROUP 5: Model Training Pipeline
+  # ════════════════════════════════════════════════════════
+  - name: training_pipeline
+    rules:
+
+      - alert: ModelTrainingFailed
+        expr: |
+          increase(model_training_runs_total{status="failure"}[1h]) > 0
+        labels:
+          severity: critical
+          team:     ml-platform
+        annotations:
+          summary:     "Model training job failed"
+          description: "Check Airflow DAG logs and MLflow run for details."
+
+      - alert: NewModelAccuracyBelowThreshold
+        expr: model_new_accuracy < 0.80
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary:     "New trained model accuracy below 0.80 — do NOT promote"
+          description: "Accuracy = {{ $value | humanize }}. Rollback or retrain with better hyperparameters."
+
+      - alert: TrainingDurationAnomaly
+        expr: |
+          model_training_duration_seconds > 3600
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Model training took > 1 hour"
+          description: "Duration = {{ $value | humanizeDuration }}. Check for data size issues."
