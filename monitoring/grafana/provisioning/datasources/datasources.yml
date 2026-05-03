@@ -1,0 +1,59 @@
+# =============================================================================
+# monitoring/grafana/provisioning/datasources/datasources.yml
+# Auto-provisioned on Grafana startup — no manual UI configuration needed.
+# =============================================================================
+
+apiVersion: 1
+
+# Delete datasources removed from this file
+deleteDatasources:
+  - name: OldDatasource
+    orgId: 1
+
+datasources:
+
+  # ── Prometheus ──────────────────────────────────────────
+  - name:      Prometheus
+    type:      prometheus
+    uid:       prometheus_telco
+    access:    proxy
+    url:       http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval:        '15s'      # match scrape_interval
+      httpMethod:          POST       # more efficient for large queries
+      queryTimeout:        '60s'
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: jaeger        # optional: link to Jaeger if deployed
+    editable: false
+
+  # ── Loki ────────────────────────────────────────────────
+  - name:   Loki
+    type:   loki
+    uid:    loki_telco
+    access: proxy
+    url:    http://loki:3100
+    jsonData:
+      maxLines: 1000
+      # Correlate Loki logs with Prometheus metrics
+      derivedFields:
+        - name:         TraceID
+          matcherRegex: 'trace_id=(\w+)'
+          url:          'http://localhost:16686/trace/${__value.raw}'
+          datasourceUid: jaeger
+        - name:         RequestID
+          matcherRegex: '"request_id":"([^"]+)"'
+          url:          ''
+    editable: false
+
+  # ── (Optional) Alertmanager ──────────────────────────────
+  - name:   Alertmanager
+    type:   alertmanager
+    uid:    alertmanager_telco
+    access: proxy
+    url:    http://alertmanager:9093
+    jsonData:
+      handleGrafanaManagedAlerts: false
+      implementation: prometheus
+    editable: false
