@@ -1,0 +1,200 @@
+# =============================================================================
+# Makefile.monitoring
+# Add these targets to the existing Makefile in the repository root.
+#
+# Usage: copy these targets into your existing Makefile,
+# OR include this file: include Makefile.monitoring
+# =============================================================================
+
+# ── Variables ────────────────────────────────────────────────
+COMPOSE_FILES = -f docker-compose.yml -f docker-compose.monitoring.yml
+PROMETHEUS_URL ?= http://localhost:9090
+GRAFANA_URL    ?= http://localhost:3000
+GRAFANA_PASS   ?= mlops_pass
+
+# ── Monitoring stack lifecycle ────────────────────────────────
+.PHONY: monitoring-up monitoring-down monitoring-logs monitoring-ps
+
+monitoring-up: network-create          ## Start full monitoring stack
+	docker-compose $(COMPOSE_FILES) up -d
+	@echo ""
+	@echo "✅ Monitoring stack started:"
+	@echo "   Prometheus: $(PROMETHEUS_URL)"
+	@echo "   Grafana:    $(GRAFANA_URL)  (admin / $(GRAFANA_PASS))"
+	@echo "   Alertmgr:   http://localhost:9093"
+	@echo "   Pushgw:     http://localhost:9091"
+
+monitoring-down:                       ## Stop monitoring stack
+	docker-compose $(COMPOSE_FILES) down
+
+monitoring-logs:                       ## Tail logs from monitoring services
+	docker-compose $(COMPOSE_FILES) logs -f prometheus grafana loki promtail alertmanager
+
+monitoring-ps:                         ## Show monitoring container status
+	docker-compose $(COMPOSE_FILES) ps
+
+network-create:                        ## Create mlops-net if missing
+	docker network create mlops-net 2>/dev/null || true
+
+# ── Config validation ─────────────────────────────────────────
+.PHONY: validate-prometheus validate-rules validate-alertmanager
+
+validate-prometheus:                   ## Validate prometheus.yml syntax
+	docker run --rm \
+	  -v $(PWD)/monitoring/prometheus:/etc/prometheus \
+	  prom/prometheus:v2.48.0 \
+	  promtool check config /etc/prometheus/prometheus.yml
+
+validate-rules:                        ## Validate all alert rule files
+	docker run --rm \
+	  -v $(PWD)/monitoring/prometheus/rules:/rules \
+	  prom/prometheus:v2.48.0 \
+	  promtool check rules /rules/ml_alerts.yml /rules/api_alerts.yml \
+	                       /rules/infra_alerts.yml /rules/recording_rules.yml
+
+validate-alertmanager:                 ## Validate alertmanager.yml syntax
+	docker run --rm \
+	  -v $(PWD)/monitoring/alertmanager:/etc/alertmanager \
+	  prom/alertmanager:v0.26.0 \
+	  amtool check-config /etc/alertmanager/alertmanager.yml
+
+validate-all: validate-prometheus validate-rules validate-alertmanager   ## Validate all configs
+	@echo "✅ All configs valid"
+
+# ── Prometheus operations ─────────────────────────────────────
+.PHONY: prom-reload prom-targets prom-alerts
+
+prom-reload:                           ## Hot-reload Prometheus config (no restart)
+	curl -s -X POST $(PROMETHEUS_URL)/-/reload
+	@echo "✅ Prometheus config reloaded"
+
+prom-targets:                          ## Show all Prometheus scrape targets
+	@curl -s "$(PROMETHEUS_URL)/api/v1/targets" | python3 -c "\
+import sys, json; \
+d = json.load(sys.stdin)['data']['activeTargets']; \
+[print(f\"  {'✅' if t['health']=='up' else '❌'} {t['labels'].get('job','?'):<20} {t['labels'].get('instance','?')}\") for t in d]"
+
+prom-alerts:                           ## Show firing Prometheus alerts
+	@curl -s "$(PROMETHEUS_URL)/api/v1/alerts" | python3 -c "\
+import sys, json; \
+d = json.load(sys.stdin)['data']['alerts']; \
+firing = [a for a in d if a['state']=='firing']; \
+print(f'Firing alerts: {len(firing)}'); \
+[print(f\"  🔴 {a['labels'].get('alertname','?')} [{a['labels'].get('severity','?')}]\") for a in firing]"
+
+# ── Drift detection ───────────────────────────────────────────
+.PHONY: generate-reference generate-drifted run-drift-check
+
+generate-reference:                    ## Generate reference (training) data for 2023
+	python src/generate_dataset.py \
+	  --samples 10000 \
+	  --start-date 2023-01-01 \
+	  --end-date   2023-06-30 \
+	  --output-dir data/reference/
+	@echo "✅ Reference data in data/reference/"
+
+generate-drifted:                      ## Generate drifted live data for 2024
+	python src/generate_dataset.py \
+	  --samples 2000 \
+	  --start-date 2024-09-01 \
+	  --end-date   2024-12-31 \
+	  --output-dir data/live/
+	@echo "✅ Drifted data in data/live/"
+
+run-drift-check:                       ## Run drift detection & push to Pushgateway
+	python monitoring/drift_exporter.py \
+	  --reference    data/reference/ \
+	  --live         data/live/ \
+	  --pushgateway  http://localhost:9091 \
+	  --model-version v1.2
+
+# ── Load testing ──────────────────────────────────────────────
+.PHONY: load-test load-test-errors load-test-slow
+
+load-test:                             ## Send 100 normal prediction requests
+	python scripts/load_test.py --requests 100 --concurrency 10
+
+load-test-errors:                      ## Send 100 requests with 20% malformed (Demo 7)
+	python scripts/load_test.py --requests 100 --error-rate 0.20
+
+load-test-slow:                        ## Send 100 requests to /predict-slow (Demo 4)
+	python scripts/load_test.py --requests 100 --endpoint /predict-slow
+
+# ── Demo runner ───────────────────────────────────────────────
+.PHONY: demo-1 demo-2 demo-4 demo-5 demo-7
+
+demo-1:  ## DEMO 1: Deploy stack + health checks
+	./scripts/demo_runner.sh 1
+
+demo-2:  ## DEMO 2: Send traffic + verify custom metrics
+	./scripts/demo_runner.sh 2
+
+demo-4:  ## DEMO 4: Inject latency spike
+	./scripts/demo_runner.sh 4
+
+demo-5:  ## DEMO 5: Run drift detection
+	./scripts/demo_runner.sh 5
+
+demo-7:  ## DEMO 7: Inject errors for log debug
+	./scripts/demo_runner.sh 7
+
+# ── Grafana dashboard management ─────────────────────────────
+.PHONY: export-dashboard import-dashboard
+
+export-dashboard:                      ## Export all Grafana dashboards to JSON files
+	@mkdir -p monitoring/grafana/dashboards
+	@curl -s "$(GRAFANA_URL)/api/search?type=dash-db" \
+	  -u "admin:$(GRAFANA_PASS)" | \
+	python3 -c "\
+import sys, json, subprocess; \
+ds = json.load(sys.stdin); \
+[subprocess.run(['curl','-s','-u','admin:$(GRAFANA_PASS)',\
+  '$(GRAFANA_URL)/api/dashboards/uid/'+d['uid'],\
+  '-o', f'monitoring/grafana/dashboards/{d[\"title\"].replace(\" \",\"_\")}.json']\
+) for d in ds if d.get('uid')]"
+	@echo "✅ Dashboards exported to monitoring/grafana/dashboards/"
+
+# ── Quick smoke test ──────────────────────────────────────────
+.PHONY: smoke-test
+
+smoke-test:                            ## Quick health check of all monitoring services
+	@echo "=== Smoke Test ==="
+	@curl -sf $(PROMETHEUS_URL)/-/healthy   && echo "✅ Prometheus" || echo "❌ Prometheus"
+	@curl -sf $(GRAFANA_URL)/api/health      && echo "✅ Grafana"    || echo "❌ Grafana"
+	@curl -sf http://localhost:3100/ready    && echo "✅ Loki"       || echo "❌ Loki"
+	@curl -sf http://localhost:9093/-/healthy && echo "✅ Alertmgr"  || echo "❌ Alertmgr"
+	@curl -sf http://localhost:9091/-/healthy && echo "✅ Pushgw"    || echo "❌ Pushgw"
+	@curl -sf http://localhost:8000/health    && echo "✅ API"       || echo "❌ API"
+
+# ── Kubernetes targets ────────────────────────────────────────
+.PHONY: k8s-monitoring-up k8s-monitoring-down k8s-monitoring-status
+
+k8s-monitoring-up:                     ## Deploy kube-prometheus-stack to k3s
+	kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+	helm upgrade --install kube-prom-stack \
+	  prometheus-community/kube-prometheus-stack \
+	  --namespace monitoring \
+	  --version 55.5.0 \
+	  -f deployment/k8s/values.yaml \
+	  --wait --timeout 10m
+	helm upgrade --install loki grafana/loki-stack \
+	  --namespace monitoring \
+	  --set grafana.enabled=false \
+	  --set promtail.enabled=true \
+	  --set loki.persistence.enabled=true \
+	  --set loki.persistence.size=10Gi
+	kubectl apply -f deployment/k8s/manifests.yaml
+	@echo "✅ K8s monitoring deployed"
+
+k8s-monitoring-status:                 ## Check monitoring pods in k3s
+	kubectl get pods -n monitoring
+
+k8s-grafana-forward:                   ## Port-forward Grafana to localhost:3000
+	kubectl port-forward svc/kube-prom-stack-grafana 3000:80 -n monitoring
+
+k8s-prometheus-forward:                ## Port-forward Prometheus to localhost:9090
+	kubectl port-forward svc/kube-prom-stack-prometheus 9090:9090 -n monitoring
+
+k8s-monitoring-down:                   ## Uninstall monitoring from k3s
+	helm uninstall kube-prom-stack -n monitoring
+	helm uninstall loki -n monitoring
