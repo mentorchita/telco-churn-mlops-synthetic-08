@@ -1,0 +1,162 @@
+# =============================================================================
+# monitoring/alertmanager/alertmanager.yml
+# Alertmanager routing and receiver configuration
+#
+# Validate:
+#   amtool check-config monitoring/alertmanager/alertmanager.yml
+#
+# Test send:
+#   amtool alert add alertname=TestAlert severity=warning --alertmanager.url=http://localhost:9093
+#
+# SECURITY NOTE: Replace webhook URLs and passwords with env vars or secrets!
+# For Docker Compose, use a .env file (see .env.example)
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+  # Slack (set your webhook URL in .env: SLACK_WEBHOOK_URL)
+  slack_api_url: 'https://hooks.slack.com/services/REPLACE/WITH/YOUR_WEBHOOK'
+
+  # Email (optional — requires SMTP)
+  smtp_smarthost:       'smtp.gmail.com:587'
+  smtp_from:            'mlops-alerts@yourcompany.com'
+  smtp_auth_username:   'mlops-alerts@yourcompany.com'
+  smtp_auth_password:   'YOUR_GMAIL_APP_PASSWORD'
+  smtp_require_tls:     true
+
+# ── Message templates ────────────────────────────────────────
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# ════════════════════════════════════════════════════════════
+# ROUTING TREE
+# Alerts flow: root route → child routes (first match wins)
+# ════════════════════════════════════════════════════════════
+route:
+  # Group alerts by these labels to reduce noise
+  group_by:       ['alertname', 'job', 'severity']
+  group_wait:     30s    # Wait 30s to batch alerts in same group
+  group_interval: 5m     # Min time between notifications for same group
+  repeat_interval: 4h    # Re-notify if alert still firing after 4h
+
+  # Default receiver for all unmatched alerts
+  receiver: 'slack-mlops-general'
+
+  routes:
+
+    # ── Critical alerts: immediate PagerDuty + Slack ──────
+    - matchers:
+        - severity = critical
+      receiver: slack-mlops-critical
+      group_wait:      10s
+      repeat_interval: 1h
+      continue: true    # also forward to default receiver
+
+    # ── ML drift alerts → dedicated ML team channel ───────
+    - matchers:
+        - alertname =~ ".*Drift.*|.*Accuracy.*|.*Training.*"
+      receiver: slack-ml-team
+      repeat_interval: 2h
+
+    # ── API down → immediate on-call ──────────────────────
+    - matchers:
+        - alertname =~ ".*APIDown|.*Down"
+      receiver: slack-mlops-critical
+      group_wait:      5s
+      repeat_interval: 30m
+
+    # ── Warning alerts → email digest ─────────────────────
+    - matchers:
+        - severity = warning
+      receiver: email-digest
+      group_interval:  15m
+      repeat_interval: 12h
+
+# ════════════════════════════════════════════════════════════
+# RECEIVERS
+# ════════════════════════════════════════════════════════════
+receivers:
+
+  # ── Default Slack channel ─────────────────────────────────
+  - name: 'slack-mlops-general'
+    slack_configs:
+      - channel:        '#mlops-alerts'
+        send_resolved:  true
+        icon_emoji:     ':robot_face:'
+        title: |
+          {{ if eq .Status "firing" }}🔴{{ else }}🟢{{ end }}
+          [{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}
+        text: |
+          *Severity:* {{ .CommonLabels.severity | title }}
+          *Job:* {{ .CommonLabels.job }}
+          *Summary:* {{ .CommonAnnotations.summary }}
+          {{ if .CommonAnnotations.description }}*Details:* {{ .CommonAnnotations.description }}{{ end }}
+          {{ if .CommonAnnotations.runbook_url }}*Runbook:* <{{ .CommonAnnotations.runbook_url }}|View>{{ end }}
+          *Alerts:*{{ range .Alerts }}
+            • {{ .Labels.alertname }}{{ end }}
+
+  # ── Critical: red alert with mentions ────────────────────
+  - name: 'slack-mlops-critical'
+    slack_configs:
+      - channel:        '#mlops-critical'
+        send_resolved:  true
+        icon_emoji:     ':rotating_light:'
+        title:          '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+        text: |
+          @channel *CRITICAL ALERT*
+          *Summary:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+          {{ if .CommonAnnotations.runbook_url }}*Runbook:* <{{ .CommonAnnotations.runbook_url }}|View Runbook>{{ end }}
+        color: 'danger'
+
+  # ── ML team for drift / model quality ────────────────────
+  - name: 'slack-ml-team'
+    slack_configs:
+      - channel:        '#ml-model-health'
+        send_resolved:  true
+        icon_emoji:     ':chart_with_downwards_trend:'
+        title: |
+          {{ if eq .Status "firing" }}📉{{ else }}✅{{ end }}
+          Model Health: {{ .GroupLabels.alertname }}
+        text: |
+          *Summary:* {{ .CommonAnnotations.summary }}
+          *Details:* {{ .CommonAnnotations.description }}
+        color: |
+          {{ if eq .Status "firing" }}warning{{ else }}good{{ end }}
+
+  # ── Email digest for warnings ──────────────────────────────
+  - name: 'email-digest'
+    email_configs:
+      - to:            'ml-team@yourcompany.com'
+        send_resolved:  true
+        headers:
+          Subject: 'MLOps Alert Digest: {{ .GroupLabels.alertname }}'
+        html: |
+          <h2>MLOps Alert: {{ .GroupLabels.alertname }}</h2>
+          <p><strong>Status:</strong> {{ .Status }}</p>
+          <p><strong>Summary:</strong> {{ .CommonAnnotations.summary }}</p>
+          <p><strong>Description:</strong> {{ .CommonAnnotations.description }}</p>
+
+  # ── Null receiver (silence alerts) ────────────────────────
+  - name: 'null'
+
+# ════════════════════════════════════════════════════════════
+# INHIBIT RULES
+# Prevent alert spam when related alerts are already firing
+# ════════════════════════════════════════════════════════════
+inhibit_rules:
+
+  # If critical is firing, silence warning for same alert/job
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal: ['alertname', 'job']
+
+  # If API is completely down, silence latency/error alerts
+  - source_matchers:
+      - alertname = ChurnAPIDown
+    target_matchers:
+      - job = churn-api
+    equal: ['job']
