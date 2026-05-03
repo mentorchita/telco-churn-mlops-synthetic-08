@@ -1,0 +1,24 @@
+# =============================================================================
+# monitoring/grafana/provisioning/dashboards/dashboards.yml
+# Grafana auto-loads all JSON files from the dashboards path.
+# Place dashboard JSON files in: monitoring/grafana/dashboards/
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+
+  - name:    'MLOps Telco Churn'
+    orgId:   1
+    folder:  'MLOps'
+    type:    file
+    # Prevent accidental deletion via UI
+    disableDeletion:          true
+    # Re-read files every 60 seconds for live updates
+    updateIntervalSeconds:    60
+    # Allow editing in UI (set false in production)
+    allowUiUpdates:           true
+    options:
+      path:                    /var/lib/grafana/dashboards
+      # Preserve folder structure from subdirectories
+      foldersFromFilesStructure: true
