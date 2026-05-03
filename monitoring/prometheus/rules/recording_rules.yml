@@ -1,0 +1,121 @@
+# =============================================================================
+# monitoring/prometheus/rules/recording_rules.yml
+# Pre-computed metrics for fast Grafana dashboards
+#
+# Naming convention: level:metric_name:operations
+#   level   = job / instance / cluster
+#   metric  = original metric name (shortened)
+#   ops     = aggregation + window (e.g., rate5m, p99_5m)
+# =============================================================================
+
+groups:
+
+  # ── API performance recordings ──────────────────────────
+  - name: churn_api_recordings
+    interval: 1m
+    rules:
+
+      # Request rate by model version and outcome
+      - record: job:predictions_total:rate5m
+        expr: |
+          sum by (model_version, outcome) (
+            rate(predictions_total[5m])
+          )
+
+      # Error rate percentage (0-100)
+      - record: job:churn_api:error_rate5m
+        expr: |
+          sum(rate(predictions_total{outcome="error"}[5m]))
+          /
+          sum(rate(predictions_total[5m]))
+          * 100
+
+      # p99 prediction latency
+      - record: job:prediction_latency:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, model_version) (
+              rate(prediction_latency_seconds_bucket[5m])
+            )
+          )
+
+      # p95 prediction latency
+      - record: job:prediction_latency:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, model_version) (
+              rate(prediction_latency_seconds_bucket[5m])
+            )
+          )
+
+      # p50 prediction latency (median)
+      - record: job:prediction_latency:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (le, model_version) (
+              rate(prediction_latency_seconds_bucket[5m])
+            )
+          )
+
+      # Average prediction latency
+      - record: job:prediction_latency:avg5m
+        expr: |
+          sum(rate(prediction_latency_seconds_sum[5m]))
+          /
+          sum(rate(prediction_latency_seconds_count[5m]))
+
+      # Churn rate from predictions — rolling 1 hour
+      - record: job:predicted_churn_rate:1h
+        expr: |
+          sum(increase(predictions_total{outcome="churn"}[1h]))
+          /
+          sum(increase(predictions_total[1h]))
+
+      # HTTP request rate by endpoint
+      - record: job:http_requests:rate5m
+        expr: |
+          sum by (endpoint, status_code) (
+            rate(api_requests_total[5m])
+          )
+
+  # ── Resource recordings ──────────────────────────────────
+  - name: resource_recordings
+    interval: 2m
+    rules:
+
+      # CPU usage percent per container
+      - record: job:container_cpu:usage_pct
+        expr: |
+          sum by (name) (
+            rate(container_cpu_usage_seconds_total{name!=""}[5m])
+          ) * 100
+
+      # Memory usage MB per container
+      - record: job:container_memory:usage_mb
+        expr: |
+          container_memory_usage_bytes{name!=""}
+          / 1024 / 1024
+
+  # ── ML health recordings ─────────────────────────────────
+  - name: ml_health_recordings
+    interval: 5m
+    rules:
+
+      # Maximum drift across all features
+      - record: job:model_drift:max_score
+        expr: |
+          max by (model_version) (
+            feature_drift_score
+          )
+
+      # Composite model health score (0 = unhealthy, 1 = perfect)
+      # Formula: 40% accuracy + 40% drift health + 20% uptime
+      - record: job:model_health:composite_score
+        expr: |
+          (
+            0.4 * clamp_max(model_accuracy, 1)
+            +
+            0.4 * (1 - clamp_max(max(feature_drift_score), 1))
+            +
+            0.2 * avg(up{job="churn-api"})
+          )
