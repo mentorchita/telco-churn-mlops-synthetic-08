@@ -1,0 +1,72 @@
+# =============================================================================
+# monitoring/prometheus/rules/api_alerts.yml
+# HTTP API alert rules for telco-churn-mlops
+# =============================================================================
+
+groups:
+
+  - name: api_availability
+    rules:
+
+      # Service completely down
+      - alert: ChurnAPIDown
+        expr: up{job="churn-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          team:     ml-platform
+        annotations:
+          summary:     "Churn Prediction API is DOWN"
+          description: "The /predict endpoint is unreachable. Check container status."
+          runbook_url: "https://wiki.company.com/mlops/runbooks/api-down"
+
+      - alert: MLflowDown
+        expr: up{job="mlflow"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary:     "MLflow tracking server is unreachable"
+          description: "Model registry and experiment tracking unavailable."
+
+  - name: api_performance
+    rules:
+
+      # HTTP 5xx server errors
+      - alert: HighHTTPErrorRate5xx
+        expr: |
+          sum(rate(api_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum(rate(api_requests_total[5m]))
+          > 0.01
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary:     "HTTP 5xx error rate > 1%"
+          description: "Rate = {{ $value | humanizePercentage }}. Server-side errors detected."
+
+      # HTTP 4xx client errors (higher threshold — client errors can be normal)
+      - alert: HighHTTPErrorRate4xx
+        expr: |
+          sum(rate(api_requests_total{status_code=~"4.."}[5m]))
+          /
+          sum(rate(api_requests_total[5m]))
+          > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "HTTP 4xx error rate > 10%"
+          description: "Rate = {{ $value | humanizePercentage }}. Check input validation or client code."
+
+      # High request rate — possible abuse or unexpected traffic
+      - alert: UnexpectedlyHighRequestRate
+        expr: |
+          sum(rate(api_requests_total[5m])) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Unusually high API request rate"
+          description: "Rate = {{ $value | humanize }} req/s. Possible load test or traffic spike."
