@@ -1,0 +1,140 @@
+# =============================================================================
+# monitoring/promtail/config.yml
+# Promtail log shipper for telco-churn-mlops
+#
+# Reads Docker container logs and ships to Loki with structured parsing.
+# FastAPI must log in JSON format for pipeline_stages to work.
+# See src/metrics.py for structured logging setup.
+# =============================================================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+# Track read positions to avoid re-sending logs after restart
+positions:
+  filename: /tmp/positions.yaml
+
+# ── Loki push endpoint ───────────────────────────────────────
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Batch settings
+    batchwait:    1s
+    batchsize:    1048576   # 1MB
+    # Retry on failure
+    backoff_config:
+      min_period:  500ms
+      max_period:  5m
+      max_retries: 10
+    # Tenant (leave blank for single-tenant Loki)
+    tenant_id: telco-churn
+
+# ════════════════════════════════════════════════════════════
+# SCRAPE CONFIGURATIONS
+# ════════════════════════════════════════════════════════════
+scrape_configs:
+
+  # ── 1. FastAPI Churn Prediction API ─────────────────────
+  # Reads logs from the 'api' container via Docker socket
+  - job_name: churn-api
+    docker_sd_configs:
+      - host:             unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name:   name
+            values: ['api']   # matches container name containing 'api'
+    relabel_configs:
+      # Only keep containers with 'api' in the name
+      - source_labels: [__meta_docker_container_name]
+        regex:          '.*api.*'
+        action:         keep
+      # Set job label from container name
+      - source_labels: [__meta_docker_container_name]
+        target_label:   job
+        regex:          '/(.*)'
+        replacement:    '${1}'
+      # Set container label
+      - source_labels: [__meta_docker_container_name]
+        target_label:   container
+        regex:          '/(.*)'
+    pipeline_stages:
+      # Stage 1: Parse JSON log lines from FastAPI / structlog
+      - json:
+          expressions:
+            level:         level
+            message:       message
+            endpoint:      endpoint
+            method:        method
+            status_code:   status_code
+            latency_ms:    latency_ms
+            model_version: model_version
+            outcome:       outcome
+            request_id:    request_id
+            timestamp:     timestamp
+      # Stage 2: Promote parsed fields to Loki stream labels
+      # WARNING: Only use low-cardinality fields here!
+      - labels:
+          level:
+          endpoint:
+          model_version:
+      # Stage 3: Set log timestamp from JSON field
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
+            - '2006-01-02T15:04:05.999999999Z07:00'
+      # Stage 4: Drop DEBUG logs in non-dev environments
+      # Comment out during development to keep DEBUG logs
+      - match:
+          selector: '{level="DEBUG"}'
+          action:   drop
+      # Stage 5: Add static label for easy filtering
+      - static_labels:
+          service: churn-api
+          env:     development
+
+  # ── 2. MLflow Tracking Server ────────────────────────────
+  - job_name: mlflow
+    docker_sd_configs:
+      - host:             unix:///var/run/docker.sock
+        refresh_interval: 10s
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        regex:          '.*mlflow.*'
+        action:         keep
+      - source_labels: [__meta_docker_container_name]
+        target_label:   job
+        regex:          '/(.*)'
+    pipeline_stages:
+      - static_labels:
+          service: mlflow
+
+  # ── 3. System logs (fallback) ────────────────────────────
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job:     varlogs
+          __path__: /var/log/*.log
+
+  # ── 4. Docker daemon logs ────────────────────────────────
+  - job_name: docker
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job:     docker
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            log:    log
+            stream: stream
+            time:   time
+      - labels:
+          stream:
+      - output:
+          source: log
