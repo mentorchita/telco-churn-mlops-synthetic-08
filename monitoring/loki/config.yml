@@ -1,0 +1,83 @@
+# =============================================================================
+# monitoring/loki/config.yml
+# Loki log storage configuration for telco-churn-mlops
+# =============================================================================
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory:  /loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+# ── Schema (how data is stored) ─────────────────────────────
+schema_config:
+  configs:
+    - from:          2020-10-24
+      store:         boltdb-shipper
+      object_store:  filesystem
+      schema:        v11
+      index:
+        prefix: index_
+        period: 24h
+
+# ── Ingestion limits ─────────────────────────────────────────
+limits_config:
+  # Rate limits
+  ingestion_rate_mb:           16
+  ingestion_burst_size_mb:     32
+  # Query limits
+  max_entries_limit_per_query: 5000
+  max_query_series:            500
+  # Retention (requires compactor)
+  retention_period:            30d
+  # Label limits (cardinality control)
+  max_label_names_per_series:  15
+  max_label_value_length:      2048
+
+# ── Compactor (handles retention) ──────────────────────────
+compactor:
+  working_directory:    /loki/compactor
+  shared_store:         filesystem
+  compaction_interval:  10m
+  retention_enabled:    true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+# ── Query performance ─────────────────────────────────────────
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled:    true
+        max_size_mb: 100
+
+# ── Ruler (for Loki alerting rules) ─────────────────────────
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path:     /loki/rules-temp
+  enable_api:    true
+
+# ── Chunk store config ────────────────────────────────────────
+chunk_store_config:
+  max_look_back_period: 0s
+
+# ── Table manager ─────────────────────────────────────────────
+table_manager:
+  retention_deletes_enabled: false
+  retention_period:          0s
