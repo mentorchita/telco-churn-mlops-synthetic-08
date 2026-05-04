@@ -59,7 +59,7 @@ services:
       - ./mlartifacts:/mlartifacts
       - ./mlflow_db:/mlflow_db
     command: >
-      /bin/sh -c "apt-get update && apt-get install -y curl && pip install --no-cache-dir mlflow && \
+      /bin/sh -c "apt-get update && apt-get install -y curl && pip install --no-cache-dir mlflow==2.8.1 && \
       mlflow server --backend-store-uri sqlite:///mlflow_db/mlflow.db \
         --default-artifact-root /mlartifacts --host 0.0.0.0 --port 5000"
     healthcheck:
