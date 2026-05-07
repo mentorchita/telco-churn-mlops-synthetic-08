@@ -19,7 +19,6 @@
 #   9091  → Pushgateway    (for batch jobs / Airflow DAGs)
 # =============================================================================
 
-version: '3.8'
 
 services:
 
@@ -37,11 +36,8 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=30d'
-      - '--storage.tsdb.retention.size=8GB'
-      - '--web.enable-lifecycle'            # allows hot-reload: POST /-/reload
+      - '--web.enable-lifecycle'
       - '--web.enable-admin-api'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
     networks:
       - mlops-net
     restart: unless-stopped
@@ -58,19 +54,11 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Security
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=mlops_pass
-      - GF_SECURITY_SECRET_KEY=telco_churn_secret_2024
-      # Access
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_AUTH_ANONYMOUS_ENABLED=false
-      # Plugins (pre-install)
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel,grafana-clock-panel
-      # Feature flags
-      - GF_FEATURE_TOGGLES_ENABLE=correlations
-      # Paths
-      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -87,7 +75,7 @@ services:
       timeout: 5s
       retries: 3
 
-  # ── Loki (log storage) ─────────────────────────────────────
+  # ── Loki ───────────────────────────────────────────────────
   loki:
     image: grafana/loki:2.9.2
     container_name: loki
@@ -106,7 +94,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Promtail (log shipper) ─────────────────────────────────
+  # ── Promtail ───────────────────────────────────────────────
   promtail:
     image: grafana/promtail:2.9.2
     container_name: promtail
@@ -134,12 +122,11 @@ services:
     command:
       - '--config.file=/etc/alertmanager/alertmanager.yml'
       - '--storage.path=/alertmanager'
-      - '--web.external-url=http://localhost:9093'
     networks:
       - mlops-net
     restart: unless-stopped
 
-  # ── Node Exporter (host metrics) ───────────────────────────
+  # ── Node Exporter ──────────────────────────────────────────
   node-exporter:
     image: prom/node-exporter:v1.7.0
     container_name: node-exporter
@@ -158,7 +145,7 @@ services:
       - mlops-net
     restart: unless-stopped
 
-  # ── cAdvisor (container metrics) ──────────────────────────
+  # ── cAdvisor ───────────────────────────────────────────────
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.47.2
     container_name: cadvisor
@@ -169,15 +156,12 @@ services:
       - /var/run:/var/run:ro
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
-      - /dev/disk/:/dev/disk:ro
     privileged: true
-    devices:
-      - /dev/kmsg
     networks:
       - mlops-net
     restart: unless-stopped
 
-  # ── Pushgateway (for batch jobs / drift exporter) ──────────
+  # ── Pushgateway ────────────────────────────────────────────
   pushgateway:
     image: prom/pushgateway:v1.7.0
     container_name: pushgateway
@@ -193,6 +177,8 @@ volumes:
   loki_data:
   alertmanager_data:
 
+# ── Та сама мережа що в docker-compose.yml
 networks:
   mlops-net:
-    external: true   # shared with main docker-compose.yml
+    external: true          # вже створена основним docker-compose.yml
+    name: mlops-net         # фіксована назва — не залежить від папки
