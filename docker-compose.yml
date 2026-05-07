@@ -1,39 +1,26 @@
 services:
-  # ── Сервіс для генерації даних (як раніше)
+  # ── Сервіс для генерації даних
   generator:
     build: .
     volumes:
       - ./data:/app/data
       - ./config:/app/config
     command: python src/generate_dataset_ext.py --samples 50000 --conv-samples 7500
+    networks:
+      - mlops-net
     healthcheck:
       test: ["CMD", "python", "-c", "print('healthy')"]
       interval: 10s
       timeout: 5s
       retries: 3
 
-  # ── Сервіс для Jupyter (новий)
-  jupyter:
-    image: quay.io/jupyter/scipy-notebook:latest
-    # або quay.io/jupyter/datascience-notebook:latest якщо хочете більше пакетів
-    ports:
-      - "8888:8888"
-    volumes:
-      - ./notebooks:/home/jovyan/work
-      - ./data:/home/jovyan/data:ro           # тільки читання, щоб не змінювали випадково
-      - ./config:/home/jovyan/config:ro
-    environment:
-      - JUPYTER_ENABLE_LAB=yes
-      - JUPYTER_TOKEN=secret123               # змініть на свій або видаліть → отримаєте випадковий
-      - NB_USER=jovyan
-      - NB_UID=1000
-      - NB_GID=1000
-    restart: unless-stopped
 
+  # ── FastAPI prediction service
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
+    container_name: churn-api          # ← ДОДАНО: фіксоване ім'я для DNS резолюції
     ports:
       - "8000:8000"
     volumes:
@@ -42,28 +29,233 @@ services:
     depends_on:
       - mlflow
     environment:
+      # - MLFLOW_HTTP_REQUEST_ALLOW_LIST={"/metrics": ["GET"]}
+      # Або спробуйте дозволити всі хости для розробки:
+      - MLFLOW_SERVER_GUNICORN_OPTS=--forwarded-allow-ips="*"
       - MODEL_PATH=/app/models/churn_model.pkl
       - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - mlops-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 3
 
+  # ── MLflow tracking server
   mlflow:
-    image: python:3.11-slim
+    image: ghcr.io/mlflow/mlflow:v2.11.3  # Остання перевірена версія
     container_name: mlflow
+    hostname: mlflow.int
     ports:
-      - "5000:5000"
+        - "5000:5000"
+    environment:
+      - MLFLOW_SERVER_ALLOWED_HOSTS=*    
     volumes:
       - ./mlartifacts:/mlartifacts
       - ./mlflow_db:/mlflow_db
-    command: >
-      /bin/sh -c "apt-get update && apt-get install -y curl && pip install --no-cache-dir mlflow==2.8.1 && \
-      mlflow server --backend-store-uri sqlite:///mlflow_db/mlflow.db \
-        --default-artifact-root /mlartifacts --host 0.0.0.0 --port 5000"
+    #vuser: root
+    entrypoint: >
+        /bin/sh -c "
+        pip install prometheus-flask-exporter &&
+        mlflow server 
+        --backend-store-uri sqlite:///mlflow_db/mlflow.db 
+        --default-artifact-root /mlartifacts 
+        --host 0.0.0.0 
+        --port 5000 
+        --expose-prometheus /metrics"
+    networks:
+      - mlops-net
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/ || exit 1"]
-      interval: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 15s
       timeout: 5s
       retries: 5
+
+
+# =============================================================================
+# docker-compose.monitoring.yml
+# Monitoring overlay for telco-churn-mlops-synthetic-07
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# Quick start:
+#   make monitoring-up       (add to Makefile, see below)
+#
+# Ports exposed:
+#   9090  → Prometheus
+#   3000  → Grafana        (admin / mlops_pass)
+#   3100  → Loki
+#   9080  → Promtail (internal)
+#   9093  → Alertmanager
+#   9100  → node-exporter
+#   8080  → cAdvisor
+#   9091  → Pushgateway    (for batch jobs / Airflow DAGs)
+# =============================================================================
+
+
+
+
+  # ── Prometheus ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - mlops-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Grafana ────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=mlops_pass
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - mlops-net
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Loki ───────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - mlops-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Promtail ───────────────────────────────────────────────
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: promtail
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - mlops-net
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # ── Alertmanager ───────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - mlops-net
+    restart: unless-stopped
+
+  # ── Node Exporter ──────────────────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - mlops-net
+    restart: unless-stopped
+
+  # ── cAdvisor ───────────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: cadvisor
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    privileged: true
+    networks:
+      - mlops-net
+    restart: unless-stopped
+
+  # ── Pushgateway ────────────────────────────────────────────
+  pushgateway:
+    image: prom/pushgateway:v1.7.0
+    container_name: pushgateway
+    ports:
+      - "9091:9091"
+    networks:
+      - mlops-net
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  alertmanager_data:
+
+
+# ── Явна мережа — не залежить від назви папки
+networks:
+  mlops-net:
+    driver: bridge
+    name: mlops-net
+    # external: true
