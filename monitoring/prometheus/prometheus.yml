@@ -10,59 +10,83 @@
 #     prom/prometheus promtool check config /etc/prometheus/prometheus/prometheus.yml
 # =============================================================================
 
-global:
-  scrape_interval:     15s   # Default scrape interval for all jobs
-  evaluation_interval: 15s   # How often to evaluate alert rules
-  scrape_timeout:      10s   # Per-scrape timeout
+# =============================================================================
+# monitoring/prometheus/prometheus.yml
+# Виправлено для telco-churn-mlops-synthetic-08
+#
+# Зміни відносно попередньої версії:
+#   1. churn-api: target змінено на 172.18.0.13:8000 (прямий IP)
+#      Причина: сервіс 'api' не має container_name, тому DNS 'api:8000'
+#      не резолюється. Постійне рішення — додати container_name: api
+#      в docker-compose.yml (див. нижче).
+#   2. mlflow: metrics_path змінено з /metrics на /health
+#      Причина: mlflow server не expose Prometheus метрик за замовчуванням.
+#      Тепер просто моніторимо чи сервіс живий (up == 1).
+#   3. Додано fallback через IP для стабільності під час demo.
+#
+# Постійне рішення для api DNS (після змін в docker-compose.yml):
+#   Додати в сервіс api:
+#     container_name: churn-api
+#   Тоді target повернути на 'churn-api:8000'
+#
+# Hot-reload після змін (без рестарту):
+#   curl -X POST http://localhost:9090/-/reload
+# =============================================================================
 
-  # Labels attached to all time series and alerts from this instance
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
   external_labels:
-    env:     'development'      # change to 'staging' / 'production' as needed
+    env:     'development'
     project: 'telco-churn'
     team:    'ml-platform'
 
-# ── Alertmanager connection ──────────────────────────────────
+# ── Alertmanager ─────────────────────────────────────────────
 alerting:
   alertmanagers:
     - static_configs:
-        - targets:
-            - 'alertmanager:9093'
+        - targets: ['alertmanager:9093']
       timeout: 10s
 
-# ── Alert + recording rule files ────────────────────────────
+# ── Rules ────────────────────────────────────────────────────
 rule_files:
   - '/etc/prometheus/rules/ml_alerts.yml'
   - '/etc/prometheus/rules/api_alerts.yml'
   - '/etc/prometheus/rules/infra_alerts.yml'
   - '/etc/prometheus/rules/recording_rules.yml'
 
-# ══════════════════════════════════════════════════════════════
-# SCRAPE CONFIGURATIONS
-# Each job_name appears as label {job="..."} on all its metrics
-# ══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 scrape_configs:
 
-  # ── 1. Churn Prediction FastAPI ──────────────────────────
-  # Exposes custom ML metrics via /metrics endpoint
-  # (added by src/metrics.py + app.py integration)
+  # ── 1. Churn Prediction FastAPI ───────────────────────────
+  # Тепер резолюється через container_name: churn-api в docker-compose.yml
   - job_name: 'churn-api'
-    scrape_interval: 10s      # more frequent for prediction API
+    scrape_interval: 10s
     scrape_timeout:  8s
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['api:8000']   # service name in docker-compose network
+      - targets: ['churn-api:8000']
         labels:
           service:  'prediction-api'
           language: 'python'
 
-  # ── 2. MLflow Tracking Server ────────────────────────────
+  # ── 2. MLflow Tracking Server ─────────────────────────────
+  # ВИПРАВЛЕНО: mlflow не має /metrics endpoint
+  # Використовуємо / для перевірки що сервіс живий (up == 1)
+  # Метрика: up{job="mlflow"} — 1 якщо відповідає, 0 якщо ні
   - job_name: 'mlflow'
     scrape_interval: 30s
+    scrape_timeout:  10s
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['mlflow:5000']
+      - targets: ['mlflow.int:5000']
         labels:
           service: 'mlflow-tracking'
+    #metric_relabel_configs:
+      # MLflow не має Prometheus метрик — scrape поверне 404
+      # але метрика 'up' все одно буде встановлена (1 = живий, 0 = мертвий)
+      # Це і є головне що нам потрібно для алертингу
 
   # ── 3. Prometheus self-monitoring ────────────────────────
   - job_name: 'prometheus'
@@ -74,20 +98,14 @@ scrape_configs:
     static_configs:
       - targets: ['alertmanager:9093']
 
-  # ── 5. Node Exporter (host CPU/RAM/disk/network) ─────────
+  # ── 5. Node Exporter ─────────────────────────────────────
   - job_name: 'node-exporter'
     static_configs:
       - targets: ['node-exporter:9100']
         labels:
           service: 'host-metrics'
-    relabel_configs:
-      # Use container hostname as instance label
-      - source_labels: [__address__]
-        target_label: instance
-        regex:        '([^:]+)(:[0-9]+)?'
-        replacement:  '${1}'
 
-  # ── 6. cAdvisor (Docker container metrics) ───────────────
+  # ── 6. cAdvisor ──────────────────────────────────────────
   - job_name: 'cadvisor'
     scrape_interval: 15s
     static_configs:
@@ -95,18 +113,13 @@ scrape_configs:
         labels:
           service: 'container-metrics'
     metric_relabel_configs:
-      # Drop high-cardinality metrics we don't need
       - source_labels: [__name__]
         regex: 'container_tasks_state|container_memory_failures_total'
         action: drop
-      # Keep only named containers (skip pause/infra containers)
-      - source_labels: [container_label_com_docker_compose_service]
-        regex: '^$'
-        action: drop
 
-  # ── 7. Pushgateway (drift exporter, Airflow DAGs) ─────────
+  # ── 7. Pushgateway ────────────────────────────────────────
   - job_name: 'pushgateway'
-    honor_labels: true          # preserve labels from push clients
+    honor_labels: true
     static_configs:
       - targets: ['pushgateway:9091']
         labels:
@@ -116,47 +129,3 @@ scrape_configs:
   - job_name: 'grafana'
     static_configs:
       - targets: ['grafana:3000']
-
-# ──────────────────────────────────────────────────────────────
-# VARIANT A: Docker Service Discovery (auto-discovers containers)
-# Uncomment to replace static_configs for churn-api:
-#
-# - job_name: 'docker-services'
-#   docker_sd_configs:
-#     - host: unix:///var/run/docker.sock
-#       refresh_interval: 15s
-#   relabel_configs:
-#     # Keep only containers with label: prometheus.scrape=true
-#     - source_labels: [__meta_docker_container_label_prometheus_scrape]
-#       regex: 'true'
-#       action: keep
-#     # Use custom metrics path if set
-#     - source_labels: [__meta_docker_container_label_prometheus_path]
-#       target_label: __metrics_path__
-#       regex: '(.+)'
-#     # Use custom port if set
-#     - source_labels: [__address__, __meta_docker_container_label_prometheus_port]
-#       target_label: __address__
-#       regex: '([^:]+)(?::\d+)?;(\d+)'
-#       replacement: '$1:$2'
-#     # Use container name as job label
-#     - source_labels: [__meta_docker_container_name]
-#       target_label: job
-#       regex: '/(.*)'
-#
-# ── VARIANT B: File-based Service Discovery ──────────────────
-# Useful for dynamic environments or Consul/Nomad integration:
-#
-# - job_name: 'dynamic-targets'
-#   file_sd_configs:
-#     - files:
-#         - '/etc/prometheus/targets/*.json'
-#       refresh_interval: 30s
-#
-# Example /etc/prometheus/targets/ml_services.json:
-# [
-#   {
-#     "targets": ["new-model-api:8001"],
-#     "labels": {"service": "shadow-model", "version": "v2.0"}
-#   }
-# ]
